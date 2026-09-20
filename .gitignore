@@ -1,0 +1,15 @@
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+project/data/
+project/test/
+project/output/
+project/checkpoints/*
+!project/checkpoints/calibration.json
+
+my_model_random_15.png
+model_random_15.png
