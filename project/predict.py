@@ -84,7 +84,7 @@ def predict(
     classifier = OrientationClassifier(batch_size=batch_size)
     _, _, tta = classifier.predict_pairs(paths, description="test")
     probabilities = temperature_scale(tta, float(calibration["temperature"]))
-    names = [path.name for path in paths]
+    names = [path.stem for path in paths]
     write_submission(output_path, names, probabilities)
     print(f"Готово: {output_path}")
     return output_path
