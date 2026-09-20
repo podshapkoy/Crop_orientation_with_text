@@ -1,4 +1,15 @@
-"""калибровка вероятностей"""
+"""
+модуль подбора параметров калибровки вероятностей
+
+Из-за целевой метрики необходимо выдавать максимально честную вероятность, и нужна калибровка
+
+- Разбиваю датасет на три фолда: calibration (фит параметров), development (выбор лучшего метода)
+и validation
+- Сравниваю два подхода: параметрический (Temperature Scaling) и непараметрический (Isotonic Regression)
+- Сохраняю параметры победившего метода для использования на инференсе
+
+Также сделана защита от утечки через криптографическое хеширование
+"""
 from __future__ import annotations
 
 import argparse
@@ -82,6 +93,10 @@ def split_records(records: Iterable[Mapping[str, str]]) -> dict[str, list[Mappin
 
 
 def make_pairs(original: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    так как синтетические данные изначально сгенерировала горизонтальном формате(под углом 0°),
+    нужно еще добавить перевернутые версии(под углом 180°), инвертируя вероятности
+    """
     probabilities = np.concatenate((original, 1.0 - original))
     labels = np.concatenate((np.zeros(len(original)), np.ones(len(original))))
     return probabilities, labels
@@ -122,13 +137,13 @@ def calibrate(
 
     raw_brier = brier_score(development_p, development_y)
 
-    # temperature scaling
+    # обучаем temperature scaling
     temperature = fit_temperature(calibration_p, calibration_y)
     temperature_brier = brier_score(
         temperature_scale(development_p, temperature), development_y
     )
 
-    # isotonic regression
+    # обучаем isotonic regression
     isotonic_model = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     isotonic_model.fit(calibration_p, calibration_y)
     x_thresholds = isotonic_model.X_thresholds_.tolist()
@@ -157,14 +172,14 @@ def calibrate(
             "calibrated": metrics(apply_calibration(probabilities), labels),
         }
         print(name, all_metrics[name])
-
+    # проверяю на адекватность модели перед сохранением
     validation_p = tta[split_indices["validation"]]
     calibrated_validation = apply_calibration(validation_p)
     if np.median(calibrated_validation) >= 0.5:
         raise RuntimeError("перепутана полярность p_180")
     if all_metrics["validation"]["calibrated"]["accuracy"] < 0.80:
         raise RuntimeError("плохие данные модели")
-
+    # сохраняю артефакт(он будет подхвачен на этапе инференса)
     artifact = {
         "schema_version": 2,
         "model_name": MODEL_NAME,

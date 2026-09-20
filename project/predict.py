@@ -1,3 +1,12 @@
+"""
+модуль инференса на тестовых данных и формирования итогового сабмита
+
+- подгружаю параметры калибровки, прогоняю картинки через модель (с TTA),
+применяю нужный скейлинг (Isotonic/Temperature) и сохраняю результат
+
+- все этапы валидируются (от проверки имен файлов до формата CSV),
+чтобы исключить загрузки битого сабмита в проверяющую систему
+"""
 from __future__ import annotations
 
 import argparse
@@ -31,6 +40,7 @@ def find_test_paths(test_dir: Path = TEST_IMAGES) -> list[Path]:
 
 
 def load_calibration(path: Path = CALIBRATION_PATH) -> dict:
+    """проверяем, что калибровка была рассчитана именно для текущей модели"""
     with path.open("r", encoding="utf-8") as file:
         calibration = json.load(file)
     if calibration.get("model_name") != MODEL_NAME:

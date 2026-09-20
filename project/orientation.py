@@ -1,4 +1,18 @@
-"""основная логика модели и метрик"""
+"""
+модуль инференса и расчета метрик
+
+- Здесь реализована обертка над легковесной моделью PP-LCNet (PaddleOCR). Выбрала данную
+архитектуру, так как она относительно быстро обрабатывает тысячи картинок на CPU
+(поэтому дополнительно включен MKLDNN)
+
+- Для качественных и стабилизированных предсказаний, TTA: каждую картинку я прогоняю
+батчами в оригинале и принудительно перевернутой на 180 градусов, а затем усредняем вероятности
+
+- Из-за целевой метрики необходимо бороться с излишней уверенностью сырого софтмакса.
+Для этого я реализовала методы калибровки: Temperature Scaling и Isotonic Regression.
+Еще для ускорения работы пайплайна в изотонической регрессии на инференсе использую `np.interp`
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,11 +34,6 @@ def check_model_dir(model_dir: Path = MODEL_DIR) -> None:
     missing = [name for name in required if not (model_dir / name).is_file()]
     if missing:
         raise FileNotFoundError(f"пустая папка: {missing}")
-
-
-def verify_model_files(model_dir: Path = MODEL_DIR) -> dict[str, str]:
-    check_model_dir(model_dir)
-    return {name: "local" for name in ("inference.json", "inference.pdiparams", "inference.yml")}
 
 
 def extract_p180(result: Mapping) -> float:
@@ -59,8 +68,7 @@ def isotonic_scale(
     x_thresholds: Sequence[float],
     y_thresholds: Sequence[float],
 ) -> np.ndarray:
-    """Кусочно-линейная калибровка по точкам изотонической регрессии.
-    Не требует sklearn на инференсе — только np.interp"""
+    """Кусочно-линейная калибровка по точкам изотонической регрессии"""
     probabilities = np.asarray(probabilities, dtype=float)
     return np.interp(probabilities, x_thresholds, y_thresholds)
 
@@ -165,7 +173,6 @@ class OrientationClassifier:
 
         original_p = np.asarray(original_p)
         rotated_p = np.asarray(rotated_p)
-        #  итоговые предсказания (TTA)
         tta_p = rotation_tta_probability(original_p, rotated_p)
         return original_p, rotated_p, tta_p
 
