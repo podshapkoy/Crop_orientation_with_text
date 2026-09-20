@@ -1,3 +1,4 @@
+"""основная логика модели и метрик"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,12 +10,12 @@ from tqdm import tqdm
 
 from config import CPU_THREADS, INFERENCE_BATCH_SIZE, MODEL_DIR, MODEL_NAME
 
-
 LABELS = {"0_degree", "180_degree"}
 EPS = 1e-6
 
 
 def check_model_dir(model_dir: Path = MODEL_DIR) -> None:
+    """проверяем наличие файлов модели PaddleOCR в директории"""
     required = ("inference.json", "inference.pdiparams", "inference.yml")
     missing = [name for name in required if not (model_dir / name).is_file()]
     if missing:
@@ -27,30 +28,56 @@ def verify_model_files(model_dir: Path = MODEL_DIR) -> dict[str, str]:
 
 
 def extract_p180(result: Mapping) -> float:
+    """
+    извлекаем вероятность перевернутости текста на 180 градусов и
+    нормирует скоры, чтобы сумма вероятностей всегда была равна 1
+    """
     labels = [str(label) for label in result["label_names"]]
     scores = np.asarray(result["scores"], dtype=float).reshape(-1)
     if set(labels) != LABELS or len(labels) != 2 or len(scores) != 2:
         raise ValueError(f"непонятные классы: {labels}")
+    # если сырые выходы модели не дают в сумме 1
     scores = scores / scores.sum()
     return float(scores[labels.index("180_degree")])
 
 
 def rotation_tta_probability(
-    original: Sequence[float] | np.ndarray,
-    rotated: Sequence[float] | np.ndarray,
+        original: Sequence[float] | np.ndarray,
+        rotated: Sequence[float] | np.ndarray,
 ) -> np.ndarray:
+    """
+    вычисляем итоговую вероятность поворота на 180°, усредняя предсказания для
+    исходной картинки и картинки, перевернутой на 180°.
+    Формула: 0.5 * (p_180_orig + (1 - p_180_rotated_image))
+    """
     original = np.asarray(original, dtype=float)
     rotated = np.asarray(rotated, dtype=float)
     return 0.5 * (original + 1.0 - rotated)
 
+def isotonic_scale(
+    probabilities: Sequence[float] | np.ndarray,
+    x_thresholds: Sequence[float],
+    y_thresholds: Sequence[float],
+) -> np.ndarray:
+    """Кусочно-линейная калибровка по точкам изотонической регрессии.
+    Не требует sklearn на инференсе — только np.interp"""
+    probabilities = np.asarray(probabilities, dtype=float)
+    return np.interp(probabilities, x_thresholds, y_thresholds)
 
 def temperature_scale(
-    probabilities: Sequence[float] | np.ndarray,
-    temperature: float,
+        probabilities: Sequence[float] | np.ndarray,
+        temperature: float,
 ) -> np.ndarray:
+    """
+    применяем Temperature Scaling для смягчения вероятности
+    (подбирается на валидационной выборке)
+    """
     probabilities = np.asarray(probabilities, dtype=float)
+    # защищаем от логарифма нуля/единицы
     probabilities = np.clip(probabilities, EPS, 1.0 - EPS)
+    # переходим от вероятностей к логитам
     logits = np.log(probabilities / (1.0 - probabilities))
+    # масштабируем логиты и делаем возврат к вероятностям через сигмоиду
     return 1.0 / (1.0 + np.exp(-np.clip(logits / temperature, -60, 60)))
 
 
@@ -65,6 +92,7 @@ def fit_temperature(probabilities: np.ndarray, labels: np.ndarray) -> float:
 
 
 def binary_metrics(probabilities: np.ndarray, labels: np.ndarray) -> dict[str, float]:
+    """основные метрики качества"""
     probabilities = np.asarray(probabilities, dtype=float)
     labels = np.asarray(labels, dtype=int)
     return {
@@ -75,10 +103,14 @@ def binary_metrics(probabilities: np.ndarray, labels: np.ndarray) -> dict[str, f
 
 
 class OrientationClassifier:
+    """
+    обертка над моделью PaddleOCR
+    """
+
     def __init__(
-        self,
-        model_dir: Path = MODEL_DIR,
-        batch_size: int = INFERENCE_BATCH_SIZE,
+            self,
+            model_dir: Path = MODEL_DIR,
+            batch_size: int = INFERENCE_BATCH_SIZE,
     ) -> None:
         check_model_dir(model_dir)
         from paddleocr import TextLineOrientationClassification
@@ -94,6 +126,7 @@ class OrientationClassifier:
         )
 
     def predict_raw(self, images: Sequence[np.ndarray]) -> np.ndarray:
+        """сырой инференс модели на батче изображений"""
         results = self.model.predict(
             input=list(images),
             batch_size=min(self.batch_size, len(images)),
@@ -101,11 +134,15 @@ class OrientationClassifier:
         return np.asarray([extract_p180(result) for result in results], dtype=float)
 
     def predict_pairs(
-        self,
-        paths: Iterable[Path],
-        show_progress: bool = True,
-        description: str = "orientation",
+            self,
+            paths: Iterable[Path],
+            show_progress: bool = True,
+            description: str = "orientation",
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Для каждого изображения подает в модель оригинал и копию, повернутую на 180°.
+        Возвращает вероятности для оригиналов, для повернутых и усредненный TTA
+        """
         paths = list(paths)
         original_p = []
         rotated_p = []
@@ -128,7 +165,9 @@ class OrientationClassifier:
 
         original_p = np.asarray(original_p)
         rotated_p = np.asarray(rotated_p)
-        return original_p, rotated_p, rotation_tta_probability(original_p, rotated_p)
+        #  итоговые предсказания (TTA)
+        tta_p = rotation_tta_probability(original_p, rotated_p)
+        return original_p, rotated_p, tta_p
 
 
 if __name__ == "__main__":

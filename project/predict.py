@@ -18,7 +18,7 @@ from config import (
     TEST_FILENAME_TEMPLATE,
     TEST_IMAGES,
 )
-from orientation import OrientationClassifier, temperature_scale
+from orientation import OrientationClassifier, temperature_scale, isotonic_scale
 
 
 def expected_test_names(count: int = EXPECTED_TEST_IMAGE_COUNT) -> list[str]:
@@ -35,8 +35,13 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict:
         calibration = json.load(file)
     if calibration.get("model_name") != MODEL_NAME:
         raise ValueError("калибровка для другой модели")
-    if float(calibration["temperature"]) <= 0:
+    method = calibration.get("method", "temperature")
+    if method == "temperature" and float(calibration["temperature"]) <= 0:
         raise ValueError("temperature не положительная")
+    if method == "isotonic":
+        x, y = calibration.get("isotonic_x", []), calibration.get("isotonic_y", [])
+        if not x or len(x) != len(y):
+            raise ValueError("некорректные isotonic thresholds")
     return calibration
 
 
@@ -83,7 +88,13 @@ def predict(
     paths = find_test_paths(test_dir)
     classifier = OrientationClassifier(batch_size=batch_size)
     _, _, tta = classifier.predict_pairs(paths, description="test")
-    probabilities = temperature_scale(tta, float(calibration["temperature"]))
+    method = calibration.get("method", "temperature")
+    if method == "isotonic":
+        probabilities = isotonic_scale(tta, calibration["isotonic_x"], calibration["isotonic_y"])
+    elif method == "temperature":
+        probabilities = temperature_scale(tta, float(calibration["temperature"]))
+    else:
+        probabilities = tta
     names = [path.stem for path in paths]
     write_submission(output_path, names, probabilities)
     print(f"Готово: {output_path}")

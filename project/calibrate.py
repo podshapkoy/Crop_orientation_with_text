@@ -1,3 +1,4 @@
+"""калибровка вероятностей"""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 import numpy as np
+from sklearn.isotonic import IsotonicRegression
 
 from config import (
     CALIBRATION_FRACTION,
@@ -27,6 +29,7 @@ from orientation import (
     binary_metrics,
     brier_score,
     fit_temperature,
+    isotonic_scale,
     temperature_scale,
 )
 
@@ -34,11 +37,16 @@ SPLIT_NAMES = ("development", "calibration", "validation")
 
 
 def split_number(value: str) -> float:
+    """
+    генерируем псевдослучайное число от 0 до 1, чтобы воспроизводимость
+    разбиения датасета была без привязки к конкретному генератору
+    """
     digest = hashlib.sha256(value.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") / 2**64
 
 
 def group_key(record: Mapping[str, str]) -> str:
+    """определяем ключ группы, чтобы похожие изображения не попали в разные сплиты"""
     group = record.get("source_group") or record.get("group")
     return group if group and group.startswith("bg_") else record["filename"]
 
@@ -110,35 +118,60 @@ def calibrate(
     }
 
     calibration_p, calibration_y = make_pairs(tta[split_indices["calibration"]])
-    candidate_temperature = fit_temperature(calibration_p, calibration_y)
-
     development_p, development_y = make_pairs(tta[split_indices["development"]])
+
     raw_brier = brier_score(development_p, development_y)
-    candidate_brier = brier_score(
-        temperature_scale(development_p, candidate_temperature), development_y
+
+    # temperature scaling
+    temperature = fit_temperature(calibration_p, calibration_y)
+    temperature_brier = brier_score(
+        temperature_scale(development_p, temperature), development_y
     )
-    temperature = candidate_temperature if candidate_brier < raw_brier else 1.0
+
+    # isotonic regression
+    isotonic_model = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    isotonic_model.fit(calibration_p, calibration_y)
+    x_thresholds = isotonic_model.X_thresholds_.tolist()
+    y_thresholds = isotonic_model.y_thresholds_.tolist()
+    isotonic_brier = brier_score(
+        isotonic_scale(development_p, x_thresholds, y_thresholds), development_y
+    )
+
+    # выбираем лучший метод по development, чтобы не переобучиться
+    candidates = {"identity": raw_brier, "temperature": temperature_brier, "isotonic": isotonic_brier}
+    method = min(candidates, key=candidates.get)
+    print("development brier по методам:", candidates, "-> выбран:", method)
+
+    def apply_calibration(probabilities: np.ndarray) -> np.ndarray:
+        if method == "temperature":
+            return temperature_scale(probabilities, temperature)
+        if method == "isotonic":
+            return isotonic_scale(probabilities, x_thresholds, y_thresholds)
+        return probabilities
 
     all_metrics = {}
     for name, indices in split_indices.items():
         probabilities, labels = make_pairs(tta[indices])
         all_metrics[name] = {
             "tta": metrics(probabilities, labels),
-            "calibrated": metrics(temperature_scale(probabilities, temperature), labels),
+            "calibrated": metrics(apply_calibration(probabilities), labels),
         }
         print(name, all_metrics[name])
 
     validation_p = tta[split_indices["validation"]]
-    calibrated_validation = temperature_scale(validation_p, temperature)
+    calibrated_validation = apply_calibration(validation_p)
     if np.median(calibrated_validation) >= 0.5:
         raise RuntimeError("перепутана полярность p_180")
     if all_metrics["validation"]["calibrated"]["accuracy"] < 0.80:
         raise RuntimeError("плохие данные модели")
 
     artifact = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_name": MODEL_NAME,
+        "method": method,
         "temperature": temperature,
+        "isotonic_x": x_thresholds,
+        "isotonic_y": y_thresholds,
         "seed": SEED,
         "split_version": SPLIT_VERSION,
         "sample_size": CALIBRATION_SAMPLE_SIZE,
