@@ -83,7 +83,7 @@ docker compose run --rm ocr-orientation python predict.py
 project/output/submission.csv
 ```
 Пример работы модели 
-![](model_random_15.png)
+![](model.png)
 ---
 
 ## Open-source компоненты
